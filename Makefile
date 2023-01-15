@@ -1,5 +1,5 @@
 .PHONY: all
-all: compile test
+all: codegen test
 
 .PHONY: codegen
 codegen:
