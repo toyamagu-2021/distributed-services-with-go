@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"flag"
 	"net"
 	"os"
 	"testing"
@@ -11,11 +12,30 @@ import (
 	"github.com/toyamagu-2021/distributed-services-with-go/internal/auth"
 	"github.com/toyamagu-2021/distributed-services-with-go/internal/config"
 	"github.com/toyamagu-2021/distributed-services-with-go/internal/server/log"
+	"github.com/toyamagu-2021/distributed-services-with-go/internal/trace"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
+
+var debug = flag.Bool("debug", false, "Enable observability for debugging.")
+
+func TestMain(m *testing.M) {
+	flag.Parse()
+	if *debug {
+		logger, err := zap.NewDevelopment()
+		if err != nil {
+			panic(err)
+		}
+		zap.ReplaceGlobals(logger)
+	}
+	os.Exit(m.Run())
+}
 
 func TestServer(t *testing.T) {
 	for scenario, fn := range map[string]func(
@@ -32,6 +52,7 @@ func TestServer(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			rootClient, nobodyClient, config, teardown := setupTest(t, nil)
 			defer teardown()
+
 			fn(t, rootClient, nobodyClient, config)
 		})
 	}
@@ -49,6 +70,7 @@ func setupTest(t *testing.T, fn func(*Config)) (
 	newClient := func(crtPath, keyPath string) (
 		*grpc.ClientConn,
 		api.LogClient,
+		*sdktrace.TracerProvider,
 		[]grpc.DialOption,
 	) {
 
@@ -64,7 +86,15 @@ func setupTest(t *testing.T, fn func(*Config)) (
 		// Without TLS
 		// clientOptions := []grpc.DialOption{grpc.WithInsecure()}
 
-		opts := []grpc.DialOption{grpc.WithTransportCredentials(tlsCreds)}
+		// Trace
+		tp, err := trace.NewTraceProviderWithStdoutTrace(os.Stderr)
+		require.NoError(t, err)
+
+		opts := []grpc.DialOption{
+			grpc.WithTransportCredentials(tlsCreds),
+			grpc.WithUnaryInterceptor(otelgrpc.UnaryClientInterceptor()),
+			grpc.WithStreamInterceptor(otelgrpc.StreamClientInterceptor()),
+		}
 
 		conn, err := grpc.Dial(
 			l.Addr().String(),
@@ -73,17 +103,19 @@ func setupTest(t *testing.T, fn func(*Config)) (
 		require.NoError(t, err)
 
 		client := api.NewLogClient(conn)
-		return conn, client, opts
+		return conn, client, tp, opts
 	}
 
 	var rootConn *grpc.ClientConn
-	rootConn, rootClient, _ = newClient(
+	var rootTp *sdktrace.TracerProvider
+	rootConn, rootClient, rootTp, _ = newClient(
 		config.RootClientCertFile,
 		config.RootClientKeyFile,
 	)
 
 	var nobodyConn *grpc.ClientConn
-	nobodyConn, nobodyClient, _ = newClient(
+	var clientTp *sdktrace.TracerProvider
+	nobodyConn, nobodyClient, clientTp, _ = newClient(
 		config.NobodyClientCertFile,
 		config.NobodyClientKeyFile,
 	)
@@ -106,6 +138,7 @@ func setupTest(t *testing.T, fn func(*Config)) (
 	require.NoError(t, err)
 
 	authorizer := auth.New(config.ACLModelFile, config.ACLPolicyFile)
+
 	cfg = &Config{CommitLog: clog, Authorizer: authorizer}
 	if fn != nil {
 		fn(cfg)
@@ -121,11 +154,19 @@ func setupTest(t *testing.T, fn func(*Config)) (
 		nobodyConn.Close()
 		l.Close()
 		clog.Remove()
+		rootTp.Shutdown(context.Background())
+		clientTp.Shutdown(context.Background())
 	}
 }
 
-func testProduceConsume(t *testing.T, client, _ api.LogClient, config *Config) {
+func testProduceConsume(
+	t *testing.T, client,
+	_ api.LogClient,
+	config *Config,
+) {
 	ctx := context.Background()
+	ctx, span := tracer.Start(ctx, "testProduceConsume")
+	defer span.End()
 	want := &api.Record{
 		Value: []byte("hello world"),
 	}
@@ -150,6 +191,8 @@ func testConsumePastBoundary(
 	config *Config,
 ) {
 	ctx := context.Background()
+	ctx, span := tracer.Start(ctx, "testConsumePastBoundary")
+	defer span.End()
 	produce, err := client.Produce(ctx, &api.ProduceRequest{
 		Record: &api.Record{
 			Value: []byte("hello world"),
@@ -169,8 +212,13 @@ func testConsumePastBoundary(
 	}
 }
 
-func testProduceConsumeStream(t *testing.T, client, _ api.LogClient, config *Config) {
+func testProduceConsumeStream(
+	t *testing.T,
+	client, _ api.LogClient,
+	config *Config) {
 	ctx := context.Background()
+	ctx, span := tracer.Start(ctx, "testProduceConsumeStream")
+	defer span.End()
 	records := []*api.Record{
 		{
 			Value:  []byte("first message"),
@@ -205,10 +253,10 @@ func testProduceConsumeStream(t *testing.T, client, _ api.LogClient, config *Con
 		for i, record := range records {
 			res, err := stream.Recv()
 			require.NoError(t, err)
-			require.Equal(t, res.Record, &api.Record{
+			require.True(t, proto.Equal(res.Record, &api.Record{
 				Value:  record.Value,
 				Offset: uint64(i),
-			})
+			}))
 		}
 	}
 }
@@ -220,6 +268,8 @@ func testUnAuthorized(
 	config *Config,
 ) {
 	ctx := context.Background()
+	ctx, span := tracer.Start(ctx, "testUnAuthorized")
+	defer span.End()
 	produce, err := client.Produce(ctx,
 		&api.ProduceRequest{
 			Record: &api.Record{

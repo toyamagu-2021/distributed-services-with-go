@@ -1,9 +1,20 @@
 package server
 
 import (
+	"log"
+	"os"
+	"time"
+
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
+	grpc_zap "github.com/grpc-ecosystem/go-grpc-middleware/logging/zap"
 	api "github.com/toyamagu-2021/distributed-services-with-go/api/v1"
+
+	"github.com/toyamagu-2021/distributed-services-with-go/internal/trace"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -11,6 +22,8 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
+
+var tracer = otel.Tracer("github.com/toyamagu-2021/distributed-service-with-go")
 
 type Config struct {
 	CommitLog  CommitLog
@@ -46,6 +59,9 @@ func newgrpcServer(config *Config) (srv *grpcServer, err error) {
 
 func (s *grpcServer) Produce(ctx context.Context, req *api.ProduceRequest) (
 	*api.ProduceResponse, error) {
+	_, span := tracer.Start(ctx, "produce")
+	defer span.End()
+
 	if err := s.Authorizer.Authorize(
 		subject(ctx),
 		objectWildcard,
@@ -61,6 +77,9 @@ func (s *grpcServer) Produce(ctx context.Context, req *api.ProduceRequest) (
 }
 
 func (s *grpcServer) Consume(ctx context.Context, req *api.ConsumeRequest) (*api.ConsumeResponse, error) {
+	_, span := tracer.Start(ctx, "consume")
+	defer span.End()
+
 	if err := s.Authorizer.Authorize(
 		subject(ctx),
 		objectWildcard,
@@ -113,14 +132,43 @@ func (s *grpcServer) ConsumeStream(req *api.ConsumeRequest, stream api.Log_Consu
 }
 
 func NewGRPCServer(config *Config, opts ...grpc.ServerOption) (*grpc.Server, error) {
+	// Logging by Zap
+	logger := zap.L().Named("server")
+	zapOpts := []grpc_zap.Option{
+		grpc_zap.WithDurationField(
+			func(duration time.Duration) zapcore.Field {
+				return zap.Int64(
+					"grpc.time_ns",
+					duration.Nanoseconds(),
+				)
+			},
+		),
+	}
+
+	// Trace and Metrics by OpenTelemetry
+	tp, err := trace.NewTraceProviderWithStdoutTrace(os.Stderr)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			log.Printf("Error shuttting donw tracer provier: %v", err)
+		}
+	}()
+
+	// Create gRPC server
 	opts = append(
 		opts,
 		grpc.StreamInterceptor(
 			grpc_middleware.ChainStreamServer(
+				otelgrpc.StreamServerInterceptor(),
+				grpc_zap.StreamServerInterceptor(logger, zapOpts...),
 				grpc_auth.StreamServerInterceptor(authenticate),
 			)),
 		grpc.UnaryInterceptor(
 			grpc_middleware.ChainUnaryServer(
+				otelgrpc.UnaryServerInterceptor(),
+				grpc_zap.UnaryServerInterceptor(logger, zapOpts...),
 				grpc_auth.UnaryServerInterceptor(authenticate),
 			)),
 	)
