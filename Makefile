@@ -1,5 +1,11 @@
+CONFIG_PATH=${HOME}/.proglog
+
 .PHONY: all
 all: codegen test
+
+.PHONY: init
+init:
+	mkdir -p ${CONFIG_PATH}
 
 .PHONY: codegen
 codegen:
@@ -13,3 +19,21 @@ codegen:
 .PHONY: test
 test:
 	go test -race ./...
+
+.PHONY: certgen
+certgen:
+	cfssl gencert -initca test/ca-csr.json | cfssljson -bare ca
+	cfssl gencert \
+		-ca=ca.pem \
+		-ca-key=ca-key.pem \
+		-config=test/ca-config.json \
+		-profile=server \
+		test/server-csr.json | cfssljson -bare server
+	cfssl gencert \
+		-ca=ca.pem \
+		-ca-key=ca-key.pem \
+		-config=test/ca-config.json \
+		-profile=client \
+		test/client-csr.json |cfssljson -bare client
+	mv *.pem *.csr ${CONFIG_PATH}
+	

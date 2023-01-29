@@ -8,8 +8,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 	api "github.com/toyamagu-2021/distributed-services-with-go/api/v1"
+	"github.com/toyamagu-2021/distributed-services-with-go/internal/config"
 	"github.com/toyamagu-2021/distributed-services-with-go/internal/server/log"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 )
 
 func TestServer(t *testing.T) {
@@ -36,11 +39,39 @@ func setupTest(t *testing.T, fn func(*Config)) (
 	teardown func(),
 ) {
 	t.Helper()
-	l, err := net.Listen("tcp", ":0")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	clientOptions := []grpc.DialOption{grpc.WithInsecure()}
-	cc, err := grpc.Dial(l.Addr().String(), clientOptions...)
+	clientTLSConfig, err := config.SetupTLSConfig(config.TLSConfig{
+		CertFile: config.ClientCertFile,
+		KeyFile:  config.ClientKeyFile,
+		CAFile:   config.CAFile,
+	})
 	require.NoError(t, err)
+
+	// Setup Client
+	clientCreds := credentials.NewTLS(clientTLSConfig)
+
+	// Without TLS
+	// clientOptions := []grpc.DialOption{grpc.WithInsecure()}
+
+	cc, err := grpc.Dial(
+		l.Addr().String(),
+		grpc.WithTransportCredentials(clientCreds),
+	)
+	require.NoError(t, err)
+
+	client = api.NewLogClient(cc)
+
+	// Setup Server
+	serverTLSConfig, err := config.SetupTLSConfig(config.TLSConfig{
+		CertFile:      config.ServerCertFile,
+		KeyFile:       config.ServerKeyFile,
+		CAFile:        config.CAFile,
+		ServerAddress: l.Addr().String(),
+		Server:        true,
+	})
+	require.NoError(t, err)
+	serverCreds := credentials.NewTLS(serverTLSConfig)
 
 	dir, err := ioutil.TempDir("", "server-test")
 	require.NoError(t, err)
@@ -52,12 +83,11 @@ func setupTest(t *testing.T, fn func(*Config)) (
 	if fn != nil {
 		fn(cfg)
 	}
-	server, err := NewGRPCServer(cfg)
+	server, err := NewGRPCServer(cfg, grpc.Creds(serverCreds))
 	require.NoError(t, err)
 	go func() {
 		server.Serve(l)
 	}()
-	client = api.NewLogClient(cc)
 	return client, cfg, func() {
 		server.Stop()
 		cc.Close()
@@ -104,8 +134,8 @@ func testConsumePastBoundary(
 	if consume != nil {
 		t.Fatal("consume not nil")
 	}
-	got := grpc.Code(err)
-	want := grpc.Code(api.ErrOffsetOutOfRange{}.GRPCStatus().Err())
+	got := status.Code(err)
+	want := status.Code(api.ErrOffsetOutOfRange{}.GRPCStatus().Err())
 	if got != want {
 		t.Fatalf("got err: %v, want: %v", got, want)
 	}
