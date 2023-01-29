@@ -1,0 +1,16 @@
+{
+  "CN": "My Awesome CA",
+  "ksy": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "Country",
+      "L": "LocalityOrMunicipality",
+      "ST": "StateOrProvince",
+      "O": "Organization",
+      "OU": "OrganizationUnit"
+    }
+  ]
+}
